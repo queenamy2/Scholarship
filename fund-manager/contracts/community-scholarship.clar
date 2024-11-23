@@ -9,7 +9,11 @@
 (define-constant ERROR_INSUFFICIENT_BALANCE (err u4))
 (define-constant ERROR_RECIPIENT_NOT_ELIGIBLE (err u5))
 (define-constant ERROR_APPLICATION_PERIOD_CLOSED (err u6))
+(define-constant ERROR_INVALID_INPUT (err u7))
 (define-constant MINIMUM_DONATION_AMOUNT u1000000) ;; in microSTX (1 STX)
+(define-constant MAXIMUM_SCHOLARSHIP_AMOUNT u1000000000) ;; 1000 STX
+(define-constant MAXIMUM_GPA u400) ;; 4.00 GPA * 100
+(define-constant MAXIMUM_ACADEMIC_YEAR u8)
 
 ;; Data Variables
 (define-data-var scholarship-pool-balance uint u0)
@@ -74,6 +78,59 @@
     )
 )
 
+(define-private (validate-applicant-name (name (string-ascii 50)))
+    (and (>= (len name) u1) (<= (len name) u50))
+)
+
+(define-private (validate-grade-point-average (gpa uint))
+    (<= gpa MAXIMUM_GPA)
+)
+
+(define-private (validate-selected-major (major (string-ascii 50)))
+    (and (>= (len major) u1) (<= (len major) u50))
+)
+
+(define-private (validate-current-year (year uint))
+    (and (>= year u1) (<= year MAXIMUM_ACADEMIC_YEAR))
+)
+
+(define-private (validate-requested-amount (amount uint))
+    (<= amount MAXIMUM_SCHOLARSHIP_AMOUNT)
+)
+
+(define-private (validate-and-sanitize-application
+    (applicant-name (string-ascii 50))
+    (grade-point-average uint)
+    (selected-major (string-ascii 50))
+    (current-year uint)
+    (requested-amount uint)
+)
+    (begin
+        ;; Perform all validations first
+        (asserts! (validate-applicant-name applicant-name) ERROR_INVALID_INPUT)
+        (asserts! (validate-grade-point-average grade-point-average) ERROR_INVALID_INPUT)
+        (asserts! (validate-selected-major selected-major) ERROR_INVALID_INPUT)
+        (asserts! (validate-current-year current-year) ERROR_INVALID_INPUT)
+        (asserts! (validate-requested-amount requested-amount) ERROR_INVALID_INPUT)
+        
+        ;; Return validated data structure
+        (ok {
+            applicant-name: applicant-name,
+            grade-point-average: grade-point-average,
+            selected-major: selected-major,
+            current-year: current-year,
+            requested-amount: requested-amount
+        })
+    )
+)
+
+(define-private (validate-principal (address principal))
+    (match (principal-destruct? address)
+        success true
+        error false
+    )
+)
+
 ;; Public Functions
 (define-public (contribute-to-scholarship-fund)
     (let (
@@ -104,27 +161,31 @@
         ERROR_APPLICATION_EXISTS
         (if (> block-height (var-get application-submission-deadline))
             ERROR_APPLICATION_PERIOD_CLOSED
-            (begin
-                (map-set ScholarshipApplications
-                    tx-sender
-                    {
-                        applicant-full-name: applicant-name,
-                        academic-performance: grade-point-average,
-                        field-of-study: selected-major,
-                        academic-year: current-year,
-                        requested-scholarship-amount: requested-amount,
-                        application-status: "PENDING"
-                    }
+            (match (validate-and-sanitize-application applicant-name grade-point-average selected-major current-year requested-amount)
+                validated-data (begin
+                    (map-set ScholarshipApplications
+                        tx-sender
+                        {
+                            applicant-full-name: (get applicant-name validated-data),
+                            academic-performance: (get grade-point-average validated-data),
+                            field-of-study: (get selected-major validated-data),
+                            academic-year: (get current-year validated-data),
+                            requested-scholarship-amount: (get requested-amount validated-data),
+                            application-status: "PENDING"
+                        }
+                    )
+                    (ok true)
                 )
-                (ok true)
+                error ERROR_INVALID_INPUT
             )
-        ))
-    )
+        )
+    ))
 )
 
 (define-public (evaluate-scholarship-application (applicant-address principal) (is-approved bool))
     (begin
         (asserts! (is-administrator) ERROR_UNAUTHORIZED_ACCESS)
+        (asserts! (validate-principal applicant-address) ERROR_INVALID_INPUT)
         (match (map-get? ScholarshipApplications applicant-address)
             current-application
             (begin
@@ -155,33 +216,36 @@
 )
 
 (define-public (process-scholarship-payment (recipient-address principal))
-    (let (
-        (recipient-details (map-get? ScholarshipRecipients recipient-address))
-    )
-    (match recipient-details
-        recipient-info
-        (if (and
-                (is-administrator)
-                (is-eq (get recipient-status recipient-info) "ACTIVE")
-                (>= (var-get scholarship-pool-balance) (get scholarship-amount recipient-info))
-            )
-            (begin
-                (try! (as-contract (stx-transfer? 
-                    (get scholarship-amount recipient-info)
-                    (as-contract tx-sender)
-                    recipient-address
-                )))
-                (var-set scholarship-pool-balance (- (var-get scholarship-pool-balance) (get scholarship-amount recipient-info)))
-                (map-set ScholarshipRecipients
-                    recipient-address
-                    (merge recipient-info {recipient-status: "PAID"})
-                )
-                (ok true)
-            )
-            ERROR_INSUFFICIENT_BALANCE
+    (begin
+        (asserts! (is-administrator) ERROR_UNAUTHORIZED_ACCESS)
+        (asserts! (validate-principal recipient-address) ERROR_INVALID_INPUT)
+        (let (
+            (recipient-details (map-get? ScholarshipRecipients recipient-address))
         )
-        ERROR_RECIPIENT_NOT_ELIGIBLE
-    ))
+        (match recipient-details
+            recipient-info
+            (if (and
+                    (is-eq (get recipient-status recipient-info) "ACTIVE")
+                    (>= (var-get scholarship-pool-balance) (get scholarship-amount recipient-info))
+                )
+                (begin
+                    (try! (as-contract (stx-transfer? 
+                        (get scholarship-amount recipient-info)
+                        (as-contract tx-sender)
+                        recipient-address
+                    )))
+                    (var-set scholarship-pool-balance (- (var-get scholarship-pool-balance) (get scholarship-amount recipient-info)))
+                    (map-set ScholarshipRecipients
+                        recipient-address
+                        (merge recipient-info {recipient-status: "PAID"})
+                    )
+                    (ok true)
+                )
+                ERROR_INSUFFICIENT_BALANCE
+            )
+            ERROR_RECIPIENT_NOT_ELIGIBLE
+        ))
+    )
 )
 
 ;; Read-Only Functions
@@ -205,6 +269,7 @@
 (define-public (update-application-deadline (new-deadline-block uint))
     (begin
         (asserts! (is-administrator) ERROR_UNAUTHORIZED_ACCESS)
+        (asserts! (> new-deadline-block block-height) ERROR_INVALID_INPUT)
         (var-set application-submission-deadline new-deadline-block)
         (ok true)
     )
@@ -213,6 +278,7 @@
 (define-public (update-disbursement-period (new-disbursement-block uint))
     (begin
         (asserts! (is-administrator) ERROR_UNAUTHORIZED_ACCESS)
+        (asserts! (> new-disbursement-block block-height) ERROR_INVALID_INPUT)
         (var-set scholarship-disbursement-period new-disbursement-block)
         (ok true)
     )
